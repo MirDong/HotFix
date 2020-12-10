@@ -1,2 +1,3 @@
+include ':hack'
 include ':app'
 rootProject.name = "HotFix"

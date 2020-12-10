@@ -1,6 +1,18 @@
+import org.apache.commons.compress.utils.IOUtils
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.Type
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassVisitor
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.MethodVisitor
+
+import java.util.jar.JarEntry
+import java.util.jar.JarFile
+import java.util.jar.JarOutputStream
+
 apply plugin: 'com.android.application'
-apply plugin: 'kotlin-android'
-apply plugin: 'kotlin-android-extensions'
+//apply plugin: 'kotlin-android'
+//apply plugin: 'kotlin-android-extensions'
 
 android {
     compileSdkVersion 28
@@ -24,6 +36,7 @@ android {
     }
 }
 
+PatchPlugin.test()
 dependencies {
     implementation fileTree(dir: "libs", include: ["*.jar"])
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
@@ -32,5 +45,132 @@ dependencies {
     testImplementation 'junit:junit:4.12'
     androidTestImplementation 'com.android.support.test:runner:1.0.2'
     androidTestImplementation 'com.android.support.test.espresso:espresso-core:3.0.2'
+    testImplementation 'org.ow2.asm:asm:7.1'
+    testImplementation 'org.ow2.asm:asm-commons:7.1'
+}
 
+afterEvaluate({
+    android.getApplicationVariants().all {
+        variant ->
+            String variantName = variant.getName()
+            String capitalizeName = variantName.capitalize()
+            println(variantName)
+            Task dexTask = project.getTasks().findByName("transformClassesWithDexBuilderFor" + capitalizeName);
+            dexTask.doFirst {
+                FileCollection files = dexTask.getInputs().getFiles()
+                for (File file:files){
+//                    println("file = "+file)
+                    String filePath = file.getAbsolutePath()
+                    if (filePath.endsWith(".jar")){
+                        processJar(file)
+                    } else if (filePath.endsWith(".class")){
+                        println("variant.getDirName() = " + variant.getDirName())
+                        processClass(variant.getDirName(),file)
+                    }
+                }
+            }
+    }
+})
+
+static void processJar(File file){
+    try {
+        File bakJar = new File(file.getParent(), file.getName() + ".bak")
+        JarOutputStream jarOutputStream = new JarOutputStream(new FileOutputStream(bakJar))
+
+        JarFile jarFile = new JarFile(file)
+        Enumeration<JarEntry> entries = jarFile.entries()
+        while (entries.hasMoreElements()) {
+            JarEntry jarEntry = entries.nextElement()
+            jarOutputStream.putNextEntry(new JarEntry(jarEntry.getName()))
+            InputStream inputStream = jarFile.getInputStream(jarEntry)
+            String className = jarEntry.getName()
+            if (className.endsWith(".class") &&
+                    !className.startsWith("com/dzk/hotfix/app/MyApplication")
+                    && !isAndroidClass(className) && !className.startsWith("com/dzk" +
+                    "/patch")) {
+                byte[] byteCode = referHackWhenInit(inputStream)
+                jarOutputStream.write(byteCode)
+            } else {
+                //输出到临时文件
+                jarOutputStream.write(IOUtils.toByteArray(inputStream));
+            }
+            jarOutputStream.closeEntry()
+        }
+        jarOutputStream.close()
+        jarFile.close()
+        file.delete()
+        bakJar.renameTo(file)
+    } catch (IOException e){
+        e.printStackTrace()
+    }
+}
+/**
+ * linux/mac: /xxxxx/app/build/intermediates/classes/debug/com/enjoy/qzonefix/MainActivity.class
+ * windows: \xxxxx\app\build\intermediates\classes\debug\com\enjoy\qzonefix\MainActivity.class
+ * @param dirName
+ * @param file
+ */
+static void processClass(String dirName,File file){
+    if (dirName == null){
+        return
+    }
+    if (dirName != null && dirName.isEmpty()){
+        return
+    }
+
+   String filePath =  file.getAbsolutePath();
+    //注意：这里的filePath包含了目录+包名+类名，所以去掉目录
+    String className = filePath.split(dirName)[1].substring(1)
+    //忽略application或android support
+    if (className.startsWith("com/dzk/hotfix/app/MyApplication") || isAndroidClass(className)){
+        return
+    }
+    try{
+        // byte[]->class 修改byte[]
+        FileInputStream fis = new FileInputStream(filePath)
+        //执行插装 byteCode:插桩后的class数据替换掉插桩之前的class文件
+        byte[] byteCode = referHackWhenInit(fis)
+        fis.close()
+
+        FileOutputStream fos = new FileOutputStream(filePath)
+        fos.write(byteCode)
+        fos.flush()
+        fos.close()
+    }catch (Exception e){
+        e.printStackTrace()
+    }
+}
+
+
+static boolean isAndroidClass(String path){
+    return path.startsWith("android") || path.startsWith("androidx")
+}
+
+
+static byte[] referHackWhenInit(InputStream inputStream){
+    //Classs解析器
+    ClassReader classReader = new ClassReader(inputStream)
+    //Class输出器
+    ClassWriter classWriter = new ClassWriter(classReader,0)
+    //Class访问者，相当于回调，解析器解析的结果，回调给访问者
+    ClassVisitor classVisitor = new ClassVisitor(Opcodes.ASM5,classWriter) {
+        //在构造函数中插桩
+        @Override
+        MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
+            MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions)
+            mv = new MethodVisitor(Opcodes.ASM5,mv) {
+                @Override
+                void visitInsn(int opcode) {
+                    if ("<init>".equals(name) && opcode == Opcodes.RETURN){
+                        super.visitLdcInsn(Type.getType("L/com/dzk/patck/hack/AntilazyLoad;"))
+                        mv.visitMethodInsn(Opcodes.INVOKESTATIC,"java/lang/System","currentTimeMillis","()J",false)
+                    }
+                    super.visitInsn(opcode)
+                }
+            }
+            return mv
+        }
+    }
+    classReader.accept(classVisitor,0)
+    return classWriter.toByteArray()
 }
